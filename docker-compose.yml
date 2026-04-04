@@ -1,0 +1,22 @@
+services:
+  epub-reader:
+    build: .
+    container_name: epub-reader
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - epub-data:/data
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/books"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  epub-data:
+    driver: local
