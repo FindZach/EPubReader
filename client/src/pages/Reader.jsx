@@ -50,85 +50,101 @@ export default function Reader() {
   // ── Init epub.js ───────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
-    let loadingTimer;
+    let epubBook;
+    let rendition;
 
-    // Fetch book metadata
-    fetch(`/api/books/${id}`)
-      .then(r => r.json())
-      .then(data => mounted && setBook(data))
-      .catch(() => mounted && setError('Could not load book metadata'));
+    async function init() {
+      // Fetch metadata and EPUB file in parallel
+      const [metaRes, fileRes, progressRes] = await Promise.all([
+        fetch(`/api/books/${id}`),
+        fetch(`/api/books/${id}/file`),
+        fetch(`/api/books/${id}/progress`),
+      ]);
 
-    // epub.js needs explicit pixel dimensions — percentage strings cause it to hang
-    const container = viewerRef.current;
-    const w = container.offsetWidth  || window.innerWidth;
-    const h = container.offsetHeight || window.innerHeight - 96;
+      if (!mounted) return;
 
-    const epubBook = new Epub(`/api/books/${id}/file`);
-    bookRef.current = epubBook;
+      const meta = await metaRes.json();
+      if (mounted) setBook(meta);
 
-    const rendition = epubBook.renderTo(container, {
-      width:  w,
-      height: h,
-      spread: 'none',
-    });
-    rendRef.current = rendition;
+      // Pass ArrayBuffer directly — avoids XHR issues epub.js has with URL-based loading
+      const buffer = await fileRes.arrayBuffer();
+      if (!mounted) return;
 
-    // Clear loading when epub.js fires its first 'rendered' event
-    rendition.on('rendered', () => {
-      if (mounted) {
-        setLoading(false);
-        clearTimeout(loadingTimer);
-      }
-    });
+      const progress = await progressRes.json().catch(() => ({ cfi: null }));
+      if (!mounted) return;
 
-    // Hard fallback: clear loading after 12 s regardless
-    loadingTimer = setTimeout(() => {
-      if (mounted) setLoading(false);
-    }, 12000);
+      const container = viewerRef.current;
+      const w = container.offsetWidth  || window.innerWidth;
+      const h = container.offsetHeight || (window.innerHeight - 96);
 
-    // Apply saved theme + font size
-    const storedTheme    = localStorage.getItem(`theme-${id}`) || 'light';
-    const storedFontSize = localStorage.getItem(`fs-${id}`) || '18px';
-    setTheme(storedTheme);
-    setFontSize(storedFontSize);
+      epubBook = new Epub(buffer);
+      bookRef.current = epubBook;
 
-    const t = THEMES[storedTheme] || THEMES.light;
-    rendition.themes.default({
-      body: {
-        color:         t.fg,
-        background:    t.bg,
-        'font-size':   storedFontSize,
-        'line-height': '1.7',
-        'padding':     '0 2em !important',
-        'font-family': 'Georgia, serif',
-      },
-      'p, li': { 'font-size': `${storedFontSize} !important` },
-    });
+      // Wait for the book to be fully parsed before rendering
+      await epubBook.ready;
+      if (!mounted) return;
 
-    // Load saved progress, then display (fire-and-forget — 'rendered' handles loading state)
-    fetch(`/api/books/${id}/progress`)
-      .then(r => r.json())
-      .then(prog => {
-        if (!mounted) return;
-        rendition.display(prog.cfi || undefined).catch(() => rendition.display().catch(() => {}));
-      })
-      .catch(() => {
-        if (mounted) rendition.display().catch(() => {});
+      // Populate TOC from the now-ready book
+      try {
+        const nav = await epubBook.loaded.navigation;
+        if (mounted) setToc(nav.toc || []);
+      } catch (_) {}
+
+      rendition = epubBook.renderTo(container, {
+        width:  w,
+        height: h,
+        spread: 'none',
+        flow:   'paginated',
+      });
+      rendRef.current = rendition;
+
+      // Apply theme + font size
+      const storedTheme    = localStorage.getItem(`theme-${id}`) || 'light';
+      const storedFontSize = localStorage.getItem(`fs-${id}`) || '18px';
+      if (mounted) { setTheme(storedTheme); setFontSize(storedFontSize); }
+
+      const t = THEMES[storedTheme] || THEMES.light;
+      rendition.themes.default({
+        body: {
+          color:         t.fg,
+          background:    t.bg,
+          'font-size':   storedFontSize,
+          'line-height': '1.7',
+          'padding':     '0 2em !important',
+          'font-family': 'Georgia, serif',
+        },
+        'p, li': { 'font-size': `${storedFontSize} !important` },
       });
 
-    // Location change → save progress
-    rendition.on('relocated', loc => {
-      if (!mounted) return;
-      const cfi = loc.start.cfi;
-      const pct = loc.start.percentage ?? 0;
-      setLocation({ cfi, percentage: pct, label: loc.start.href || '' });
-      saveProgress(cfi, pct);
-    });
+      rendition.on('rendered', () => {
+        if (mounted) setLoading(false);
+      });
 
-    // Load TOC
-    epubBook.loaded.navigation
-      .then(nav => mounted && setToc(nav.toc || []))
-      .catch(() => {});
+      rendition.on('relocated', loc => {
+        if (!mounted) return;
+        const cfi = loc.start.cfi;
+        const pct = loc.start.percentage ?? 0;
+        setLocation({ cfi, percentage: pct, label: loc.start.href || '' });
+        saveProgress(cfi, pct);
+      });
+
+      // Display at saved position, fallback to start
+      try {
+        await rendition.display(progress.cfi || undefined);
+      } catch (_) {
+        await rendition.display().catch(() => {});
+      }
+
+      if (mounted) setLoading(false);
+    }
+
+    init().catch(err => {
+      console.error('Reader init failed:', err);
+      if (mounted) {
+        setError('Failed to load book. The file may be corrupted or unsupported.');
+        setLoading(false);
+      }
+    });
 
     // Keyboard navigation
     const onKey = (e) => {
@@ -141,11 +157,10 @@ export default function Reader() {
 
     return () => {
       mounted = false;
-      clearTimeout(loadingTimer);
       window.removeEventListener('keydown', onKey);
       clearTimeout(hideBarTimer.current);
-      rendition.destroy();
-      epubBook.destroy();
+      try { rendition?.destroy(); } catch (_) {}
+      try { epubBook?.destroy(); } catch (_) {}
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
