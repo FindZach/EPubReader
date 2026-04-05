@@ -14,7 +14,7 @@ app.use(express.json());
 app.use('/api/books', booksRouter);
 
 // Serve React build in production
-const publicDir = path.join(__dirname, '../../public');
+const publicDir = path.join(__dirname, '../public');
 app.use(express.static(publicDir));
 
 // Catch-all: send index.html for client-side routing
