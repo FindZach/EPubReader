@@ -50,6 +50,7 @@ export default function Reader() {
   // ── Init epub.js ───────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
+    let loadingTimer;
 
     // Fetch book metadata
     fetch(`/api/books/${id}`)
@@ -57,15 +58,33 @@ export default function Reader() {
       .then(data => mounted && setBook(data))
       .catch(() => mounted && setError('Could not load book metadata'));
 
+    // epub.js needs explicit pixel dimensions — percentage strings cause it to hang
+    const container = viewerRef.current;
+    const w = container.offsetWidth  || window.innerWidth;
+    const h = container.offsetHeight || window.innerHeight - 96;
+
     const epubBook = new Epub(`/api/books/${id}/file`);
     bookRef.current = epubBook;
 
-    const rendition = epubBook.renderTo(viewerRef.current, {
-      width:  '100%',
-      height: '100%',
+    const rendition = epubBook.renderTo(container, {
+      width:  w,
+      height: h,
       spread: 'none',
     });
     rendRef.current = rendition;
+
+    // Clear loading when epub.js fires its first 'rendered' event
+    rendition.on('rendered', () => {
+      if (mounted) {
+        setLoading(false);
+        clearTimeout(loadingTimer);
+      }
+    });
+
+    // Hard fallback: clear loading after 12 s regardless
+    loadingTimer = setTimeout(() => {
+      if (mounted) setLoading(false);
+    }, 12000);
 
     // Apply saved theme + font size
     const storedTheme    = localStorage.getItem(`theme-${id}`) || 'light';
@@ -76,32 +95,25 @@ export default function Reader() {
     const t = THEMES[storedTheme] || THEMES.light;
     rendition.themes.default({
       body: {
-        color:      t.fg,
-        background: t.bg,
-        'font-size': storedFontSize,
+        color:         t.fg,
+        background:    t.bg,
+        'font-size':   storedFontSize,
         'line-height': '1.7',
-        'padding': '0 2em !important',
+        'padding':     '0 2em !important',
         'font-family': 'Georgia, serif',
       },
       'p, li': { 'font-size': `${storedFontSize} !important` },
     });
 
-    // Load progress then display
+    // Load saved progress, then display (fire-and-forget — 'rendered' handles loading state)
     fetch(`/api/books/${id}/progress`)
       .then(r => r.json())
-      .then(async prog => {
+      .then(prog => {
         if (!mounted) return;
-        try {
-          await rendition.display(prog.cfi || undefined);
-        } catch {
-          await rendition.display();
-        }
-        setLoading(false);
+        rendition.display(prog.cfi || undefined).catch(() => rendition.display().catch(() => {}));
       })
-      .catch(async () => {
-        if (!mounted) return;
-        await rendition.display().catch(() => {});
-        setLoading(false);
+      .catch(() => {
+        if (mounted) rendition.display().catch(() => {});
       });
 
     // Location change → save progress
@@ -109,8 +121,7 @@ export default function Reader() {
       if (!mounted) return;
       const cfi = loc.start.cfi;
       const pct = loc.start.percentage ?? 0;
-      const label = loc.start.href || '';
-      setLocation({ cfi, percentage: pct, label });
+      setLocation({ cfi, percentage: pct, label: loc.start.href || '' });
       saveProgress(cfi, pct);
     });
 
@@ -130,6 +141,7 @@ export default function Reader() {
 
     return () => {
       mounted = false;
+      clearTimeout(loadingTimer);
       window.removeEventListener('keydown', onKey);
       clearTimeout(hideBarTimer.current);
       rendition.destroy();
